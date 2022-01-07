@@ -1,6 +1,5 @@
 use crate::prelude::graphql::*;
 use displaydoc::Display;
-use futures::prelude::*;
 use miette::{Diagnostic, NamedSource, Report, SourceSpan};
 pub use router_bridge::plan::PlanningErrors;
 use serde::{Deserialize, Serialize};
@@ -13,7 +12,7 @@ use tracing::level_filters::LevelFilter;
 ///
 /// Note that these are not actually returned to the client, but are instead converted to JSON for
 /// [`struct@Error`].
-#[derive(Error, Display, Debug, Serialize, Deserialize)]
+#[derive(Error, Display, Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 #[ignore_extra_doc_attributes]
 pub enum FetchError {
@@ -214,9 +213,9 @@ impl From<CacheResolverError> for QueryPlannerError {
     }
 }
 
-impl From<QueryPlannerError> for ResponseStream {
+impl From<QueryPlannerError> for Response {
     fn from(err: QueryPlannerError) -> Self {
-        stream::once(future::ready(FetchError::from(err).to_response(true))).boxed()
+        FetchError::from(err).to_response(true)
     }
 }
 

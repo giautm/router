@@ -1,9 +1,10 @@
 use apollo_router_core::prelude::*;
 use async_trait::async_trait;
 use derivative::Derivative;
-use futures::{lock::Mutex, prelude::*};
+use futures::lock::Mutex;
 use std::collections::HashMap;
 use tokio::sync::broadcast::{self, Sender};
+
 use tracing::Instrument;
 use url::Url;
 
@@ -17,7 +18,7 @@ pub struct HttpSubgraphFetcher {
     #[derivative(Debug = "ignore")]
     http_client: reqwest_middleware::ClientWithMiddleware,
     #[derivative(Debug = "ignore")]
-    wait_map: Mutex<HashMap<String, Sender<graphql::Response>>>,
+    wait_map: Mutex<HashMap<String, Sender<Result<graphql::Response, graphql::FetchError>>>>,
 }
 
 impl HttpSubgraphFetcher {
@@ -79,35 +80,26 @@ impl HttpSubgraphFetcher {
 
     fn map_to_graphql(
         service_name: String,
-        response: Result<bytes::Bytes, graphql::FetchError>,
-    ) -> graphql::ResponseStream {
-        Box::pin(
-            async move {
-                let is_primary = true;
-                match response {
-                    Err(e) => e.to_response(is_primary),
-                    Ok(bytes) => tracing::debug_span!("parse_subgraph_response").in_scope(|| {
-                        serde_json::from_slice::<graphql::Response>(&bytes).unwrap_or_else(
-                            |error| {
-                                graphql::FetchError::SubrequestMalformedResponse {
-                                    service: service_name.clone(),
-                                    reason: error.to_string(),
-                                }
-                                .to_response(is_primary)
-                            },
-                        )
-                    }),
+        response: bytes::Bytes,
+    ) -> Result<graphql::Response, graphql::FetchError> {
+        tracing::debug_span!("parse_subgraph_response").in_scope(|| {
+            serde_json::from_slice::<graphql::Response>(&response).map_err(|error| {
+                graphql::FetchError::SubrequestMalformedResponse {
+                    service: service_name.clone(),
+                    reason: error.to_string(),
                 }
-            }
-            .into_stream(),
-        )
+            })
+        })
     }
 
-    async fn dedup(&self, request: graphql::Request) -> graphql::ResponseStream {
+    async fn dedup(
+        &self,
+        request: graphql::Request,
+    ) -> Result<graphql::Response, graphql::FetchError> {
         let hashed_request = serde_json::to_string(&request).unwrap();
 
         let mut locked_wait_map = self.wait_map.lock().await;
-        let res = match locked_wait_map.get_mut(&hashed_request) {
+        match locked_wait_map.get_mut(&hashed_request) {
             Some(waiter) => {
                 // Register interest in key
                 let mut receiver = waiter.subscribe();
@@ -120,12 +112,7 @@ impl HttpSubgraphFetcher {
                 locked_wait_map.insert(hashed_request.clone(), tx.clone());
                 drop(locked_wait_map);
 
-                let service_name = self.service.to_string();
-                let bytes_stream = self.request_stream(request).await;
-                let res = Self::map_to_graphql(service_name, bytes_stream)
-                    .next()
-                    .await
-                    .unwrap();
+                let res = self.fetch(request).await;
 
                 let mut locked_wait_map = self.wait_map.lock().await;
                 locked_wait_map.remove(&hashed_request);
@@ -140,16 +127,26 @@ impl HttpSubgraphFetcher {
                 .expect("can only fail if the task is aborted or if the internal code panics, neither is possible here; qed");
                 res
             }
-        };
+        }
+    }
 
-        Box::pin(async { res }.into_stream())
+    async fn fetch(
+        &self,
+        request: graphql::Request,
+    ) -> Result<graphql::Response, graphql::FetchError> {
+        let service_name = self.service.to_string();
+        let response = self.request_stream(request).await?;
+        Self::map_to_graphql(service_name, response)
     }
 }
 
 #[async_trait]
 impl graphql::Fetcher for HttpSubgraphFetcher {
     /// Using reqwest fetch a stream of graphql results.
-    async fn stream(&self, request: graphql::Request) -> graphql::ResponseStream {
+    async fn stream(
+        &self,
+        request: graphql::Request,
+    ) -> Result<graphql::Response, graphql::FetchError> {
         self.dedup(request).await
     }
 }
@@ -191,7 +188,7 @@ mod tests {
 
     #[test(tokio::test)]
     async fn test_non_chunked() -> Result<(), Box<dyn std::error::Error>> {
-        let response = graphql::Response::builder()
+        let expected_response = graphql::Response::builder()
             .data(json!({
               "allProducts": [
                 {
@@ -217,21 +214,20 @@ mod tests {
                 .body_matches(Regex::new(".*").unwrap());
             then.status(200)
                 .header("Content-Type", "application/json")
-                .json_body_obj(&response);
+                .json_body_obj(&expected_response);
         });
         let fetcher =
             HttpSubgraphFetcher::new("products", Url::parse(&server.url("/graphql")).unwrap());
-        let collect = fetcher
+        let response = fetcher
             .stream(
                 graphql::Request::builder()
                     .query(r#"{allProducts{variation {id}id}}"#)
                     .build(),
             )
             .await
-            .collect::<Vec<_>>()
-            .await;
+            .unwrap();
 
-        assert_eq!(collect[0], response);
+        assert_eq!(response, expected_response);
         mock.assert();
         Ok(())
     }
