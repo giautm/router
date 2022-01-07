@@ -114,8 +114,11 @@ impl HttpSubgraphFetcher {
 
                 let res = self.fetch(request).await;
 
-                let mut locked_wait_map = self.wait_map.lock().await;
-                locked_wait_map.remove(&hashed_request);
+                {
+                    let mut locked_wait_map = self.wait_map.lock().await;
+                    locked_wait_map.remove(&hashed_request);
+                }
+
                 // Let our waiters know
                 let broadcast_value = res.clone();
                 // Our use case is very specific, so we are sure that
