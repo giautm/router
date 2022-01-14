@@ -18,7 +18,8 @@ pub struct HttpSubgraphFetcher {
     #[derivative(Debug = "ignore")]
     http_client: reqwest_middleware::ClientWithMiddleware,
     #[derivative(Debug = "ignore")]
-    wait_map: Mutex<HashMap<String, Sender<Result<graphql::Response, graphql::FetchError>>>>,
+    wait_map:
+        Mutex<HashMap<graphql::Request, Sender<Result<graphql::Response, graphql::FetchError>>>>,
 }
 
 impl HttpSubgraphFetcher {
@@ -96,13 +97,9 @@ impl HttpSubgraphFetcher {
         &self,
         request: graphql::Request,
     ) -> Result<graphql::Response, graphql::FetchError> {
-        let hashed_request = serde_json::to_string(&request).expect(
-            "the serializer for Request cannot panic and its fields are always strings; qed",
-        );
-
         loop {
             let mut locked_wait_map = self.wait_map.lock().await;
-            match locked_wait_map.get_mut(&hashed_request) {
+            match locked_wait_map.get_mut(&request) {
                 Some(waiter) => {
                     // Register interest in key
                     let mut receiver = waiter.subscribe();
@@ -116,14 +113,14 @@ impl HttpSubgraphFetcher {
                 }
                 None => {
                     let (tx, _rx) = broadcast::channel(1);
-                    locked_wait_map.insert(hashed_request.clone(), tx.clone());
+                    locked_wait_map.insert(request.clone(), tx.clone());
                     drop(locked_wait_map);
 
-                    let res = self.fetch(request).await;
+                    let res = self.fetch(request.clone()).await;
 
                     {
                         let mut locked_wait_map = self.wait_map.lock().await;
-                        locked_wait_map.remove(&hashed_request);
+                        locked_wait_map.remove(&request);
                     }
 
                     // Let our waiters know
