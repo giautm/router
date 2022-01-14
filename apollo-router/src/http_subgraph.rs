@@ -150,7 +150,7 @@ impl HttpSubgraphFetcher {
 
 #[async_trait]
 impl graphql::Fetcher for HttpSubgraphFetcher {
-    /// Using reqwest fetch a stream of graphql results.
+    /// Using reqwest to fetch a graphql response
     async fn stream(
         &self,
         request: graphql::Request,
